@@ -22,4 +22,7 @@ const (
 	// string-value errors, and clients match on the text.
 	errHashNotInteger = respError("ERR hash value is not an integer")
 	errHashNotFloat   = respError("ERR hash value is not a float")
+
+	// A NaN score has no ordering, so it would corrupt the skiplist.
+	errNaNScore = respError("ERR resulting score is not a number (NaN)")
 )

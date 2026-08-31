@@ -761,6 +761,8 @@ func TypeName(v any) string {
 		return "hash"
 	case *Set:
 		return "set"
+	case *ZSet:
+		return "zset"
 	default:
 		return "none"
 	}
