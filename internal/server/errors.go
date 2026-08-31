@@ -17,4 +17,9 @@ const (
 	errIncrOverflow  = respError("ERR increment or decrement would overflow")
 	errNaNOrInf      = respError("ERR increment would produce NaN or Infinity")
 	errStringTooLong = respError("ERR string exceeds maximum allowed size (proto-max-bulk-len)")
+
+	// Hash fields get their own wording in Redis rather than reusing the
+	// string-value errors, and clients match on the text.
+	errHashNotInteger = respError("ERR hash value is not an integer")
+	errHashNotFloat   = respError("ERR hash value is not a float")
 )

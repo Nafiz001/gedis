@@ -757,6 +757,10 @@ func TypeName(v any) string {
 		return "string"
 	case *List:
 		return "list"
+	case *Hash:
+		return "hash"
+	case *Set:
+		return "set"
 	default:
 		return "none"
 	}

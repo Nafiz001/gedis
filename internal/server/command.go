@@ -109,6 +109,43 @@ func init() {
 		commandSpec{name: "lmove", handler: cmdLMove, arity: 5, write: true},
 		commandSpec{name: "rpoplpush", handler: cmdLMove, arity: 3, write: true},
 
+		// --- hashes ---
+		commandSpec{name: "hset", handler: cmdHSet, arity: -4, write: true},
+		commandSpec{name: "hmset", handler: cmdHSet, arity: -4, write: true},
+		commandSpec{name: "hsetnx", handler: cmdHSetNX, arity: 4, write: true},
+		commandSpec{name: "hget", handler: cmdHGet, arity: 3},
+		commandSpec{name: "hmget", handler: cmdHMGet, arity: -3},
+		commandSpec{name: "hdel", handler: cmdHDel, arity: -3, write: true},
+		commandSpec{name: "hlen", handler: cmdHLen, arity: 2},
+		commandSpec{name: "hexists", handler: cmdHExists, arity: 3},
+		commandSpec{name: "hstrlen", handler: cmdHStrlen, arity: 3},
+		commandSpec{name: "hkeys", handler: cmdHKeys, arity: 2},
+		commandSpec{name: "hvals", handler: cmdHVals, arity: 2},
+		commandSpec{name: "hgetall", handler: cmdHGetAll, arity: 2},
+		commandSpec{name: "hincrby", handler: cmdHIncrBy, arity: 4, write: true},
+		commandSpec{name: "hincrbyfloat", handler: cmdHIncrByFloat, arity: 4, write: true},
+		commandSpec{name: "hrandfield", handler: cmdHRandField, arity: -2},
+		commandSpec{name: "hscan", handler: cmdHScan, arity: -3},
+
+		// --- sets ---
+		commandSpec{name: "sadd", handler: cmdSAdd, arity: -3, write: true},
+		commandSpec{name: "srem", handler: cmdSRem, arity: -3, write: true},
+		commandSpec{name: "scard", handler: cmdSCard, arity: 2},
+		commandSpec{name: "sismember", handler: cmdSIsMember, arity: 3},
+		commandSpec{name: "smismember", handler: cmdSMIsMember, arity: -3},
+		commandSpec{name: "smembers", handler: cmdSMembers, arity: 2},
+		commandSpec{name: "spop", handler: cmdSPop, arity: -2, write: true},
+		commandSpec{name: "srandmember", handler: cmdSRandMember, arity: -2},
+		commandSpec{name: "smove", handler: cmdSMove, arity: 4, write: true},
+		commandSpec{name: "sinter", handler: cmdSInter, arity: -2},
+		commandSpec{name: "sunion", handler: cmdSUnion, arity: -2},
+		commandSpec{name: "sdiff", handler: cmdSDiff, arity: -2},
+		commandSpec{name: "sinterstore", handler: cmdSInterStore, arity: -3, write: true},
+		commandSpec{name: "sunionstore", handler: cmdSUnionStore, arity: -3, write: true},
+		commandSpec{name: "sdiffstore", handler: cmdSDiffStore, arity: -3, write: true},
+		commandSpec{name: "sintercard", handler: cmdSInterCard, arity: -3},
+		commandSpec{name: "sscan", handler: cmdSScan, arity: -3},
+
 		// --- keyspace ---
 		commandSpec{name: "del", handler: cmdDel, arity: -2, write: true},
 		commandSpec{name: "unlink", handler: cmdDel, arity: -2, write: true},
@@ -237,4 +274,67 @@ func (c *client) replyStoreError(err error) {
 		return
 	}
 	c.replyErrorf("ERR %s", err.Error())
+}
+
+// --- collection scanning ---
+//
+// HSCAN, SSCAN and ZSCAN all page through one key's contents. They share the
+// argument grammar and the cursor scheme below.
+
+// parseCollectionScan reads the common "cursor [MATCH p] [COUNT n]" arguments.
+// It writes the error reply itself and returns false when the syntax is wrong.
+func (c *client) parseCollectionScan(args [][]byte) (cursor uint64, pattern string, count int, ok bool) {
+	n, err := strconv.ParseUint(string(args[2]), 10, 64)
+	if err != nil {
+		c.replyError("ERR invalid cursor")
+		return 0, "", 0, false
+	}
+	cursor, pattern, count = n, "*", 10
+
+	for i := 3; i < len(args); i++ {
+		if i+1 >= len(args) {
+			c.replySyntaxError()
+			return 0, "", 0, false
+		}
+		option := strings.ToLower(string(args[i]))
+		i++
+		switch option {
+		case "match":
+			pattern = string(args[i])
+		case "count":
+			v, valid := c.parseInt(args[i])
+			if !valid {
+				return 0, "", 0, false
+			}
+			if v < 1 {
+				c.replySyntaxError()
+				return 0, "", 0, false
+			}
+			count = int(v)
+		default:
+			c.replySyntaxError()
+			return 0, "", 0, false
+		}
+	}
+	return cursor, pattern, count, true
+}
+
+// pageCollection returns one page of a sorted name list and the cursor for the
+// next call, with 0 meaning iteration is complete.
+//
+// The cursor is simply an offset into the sorted order. Sorting on every call
+// costs O(n log n), which is the price of a stable position: Go maps randomise
+// iteration, so an offset into raw map order would skip and repeat elements
+// unpredictably. Redis avoids both by giving its hash table reverse-binary
+// cursors, which is the proper fix and is noted as future work.
+func pageCollection(sorted []string, cursor uint64, count int) (uint64, []string) {
+	if cursor >= uint64(len(sorted)) {
+		return 0, nil
+	}
+	start := int(cursor)
+	end := start + count
+	if end >= len(sorted) {
+		return 0, sorted[start:]
+	}
+	return uint64(end), sorted[start:end]
 }
