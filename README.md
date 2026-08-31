@@ -15,13 +15,24 @@ OK
 (integer) 16
 127.0.0.1:6380> GET user:1
 "Nafiz Ahmed (BD)"
-127.0.0.1:6380> SET session:abc token EX 60
-OK
-127.0.0.1:6380> TTL session:abc
-(integer) 60
-127.0.0.1:6380> INFO keyspace
-# Keyspace
-db0:keys=5,expires=1,avg_ttl=0
+127.0.0.1:6380> ZADD leaderboard 1520 nafiz 1890 rahim 2100 sadia
+(integer) 3
+127.0.0.1:6380> ZINCRBY leaderboard 300 nafiz
+"1820"
+127.0.0.1:6380> ZREVRANGE leaderboard 0 2 WITHSCORES
+1) "sadia"
+2) "2100"
+3) "rahim"
+4) "1890"
+5) "nafiz"
+6) "1820"
+127.0.0.1:6380> LMOVE jobs processing LEFT RIGHT
+"email:1"
+127.0.0.1:6380> HINCRBY session:abc logins 1
+(integer) 42
+127.0.0.1:6380> SINTER post:1 post:2
+1) "go"
+2) "backend"
 ```
 
 ## Why build this
@@ -34,7 +45,7 @@ matching an error string exactly because real clients branch on it.
 
 ## What works
 
-**60 commands**, matching Redis semantics including the modifier combinations
+**135 commands**, matching Redis semantics including the modifier combinations
 that actually carry meaning.
 
 | Family | Commands |
@@ -44,6 +55,10 @@ that actually carry meaning.
 | Keyspace | `DEL`, `UNLINK`, `EXISTS`, `TYPE`, `KEYS`, `SCAN` (`MATCH` `COUNT` `TYPE`), `RANDOMKEY`, `RENAME`, `RENAMENX`, `COPY` |
 | Expiration | `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` (`NX` `XX` `GT` `LT`), `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` |
 | Connection | `PING`, `ECHO`, `SELECT`, `AUTH`, `HELLO`, `RESET`, `QUIT`, `CLIENT`, `COMMAND` |
+| Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LINSERT`, `LREM`, `LTRIM`, `LPOS`, `LMOVE`, `RPOPLPUSH` |
+| Hashes | `HSET`, `HMSET`, `HSETNX`, `HGET`, `HMGET`, `HDEL`, `HLEN`, `HEXISTS`, `HSTRLEN`, `HKEYS`, `HVALS`, `HGETALL`, `HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD`, `HSCAN` |
+| Sets | `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`, `SRANDMEMBER`, `SMOVE`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SINTERCARD`, `SSCAN` |
+| Sorted sets | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`), `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZLEXCOUNT`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`), `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREM`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`, `ZSCAN`, `ZUNION`, `ZINTER`, `ZDIFF`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` |
 | Server | `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `TIME`, `CONFIG`, `DEBUG`, `SHUTDOWN` |
 
 Also: 16 independent `SELECT`-able databases, `requirepass` authentication,
@@ -66,7 +81,15 @@ classes, and graceful shutdown on `SIGINT`/`SIGTERM`.
               │  │ sh │ sh │ ... │  │  key → FNV-1a → shard
               │  └────┴────┴─────┘  │
               │  + active expiry    │  background sampler
-              └─────────────────────┘
+              └──────────┬──────────┘
+                         │  values
+              ┌──────────▼─────────────────────────────┐
+              │ []byte   string                        │
+              │ List     ring-buffer deque             │
+              │ Hash     map                           │
+              │ Set      map                           │
+              │ ZSet     map + skiplist (span-indexed) │
+              └────────────────────────────────────────┘
 ```
 
 ### Decisions worth explaining
@@ -96,6 +119,25 @@ expire.
 **Flush per batch, not per command.** The connection loop only flushes when the
 read buffer is drained. A client pipelining 500 commands gets one write syscall
 instead of 500 — worth roughly 10× on throughput.
+
+**A skiplist for sorted sets, and spans are the reason.** Each forward pointer
+records how many nodes it jumps over, so summing spans along a search path
+yields an element's rank for free. That is what makes `ZRANK` O(log n) instead
+of a linear count, and lets `ZRANGE` jump straight to an index rather than
+walking there. A `ZSet` pairs that skiplist with a map, so `ZSCORE` stays O(1)
+while ordered queries stay O(log n); the cost is that a rescore must delete and
+reinsert, because the score is part of the skiplist's sort key.
+
+**Lists are a ring buffer, not a linked list.** Redis uses a quicklist, which
+optimises for memory. A ring buffer trades a little space for speed that suits
+this server: O(1) at both ends, O(1) `LINDEX`, and contiguous storage so
+walking a range touches far fewer cache lines than chasing node pointers.
+Inserts and removals shift whichever side is shorter.
+
+**Hashes and sets are plain maps.** Redis keeps a second compact encoding for
+each -- listpacks for small hashes, intsets for all-integer sets -- purely to
+save memory in its own allocator layout. That buys nothing here and would put a
+size check on every access, so gedis uses one representation and says so.
 
 **Error strings are copied exactly.** The first word of a Redis error
 (`WRONGTYPE`, `NOAUTH`, `WRONGPASS`, `ERR`) is a machine-readable code that real
@@ -150,6 +192,10 @@ Component-level, from `go test -bench`:
 | RESP bulk reply encode | 19 ns/op, **0 allocs** |
 | Store `Get` (parallel) | 62 ns/op |
 | Store `Set` (parallel) | 138 ns/op |
+| `ZRANK` on 100k members | 320 ns/op |
+| `ZRANGE` of 10 from the middle of 100k | 237 ns/op |
+| List push+pop at the front | 10 ns/op, **0 allocs** |
+| List `LINDEX` | 2.4 ns/op, **0 allocs** |
 
 ## Testing
 
@@ -160,11 +206,24 @@ ok  github.com/nafizahmed/gedis/internal/server  2.064s
 ok  github.com/nafizahmed/gedis/internal/store   1.767s
 ```
 
-112 tests, race-clean. The server tests are end-to-end over a real TCP socket
+183 tests, race-clean. The server tests are end-to-end over a real TCP socket
 rather than direct handler calls, because the mistakes that matter here are
 reply framing, exact error text, and pipelined ordering — none of which a unit
 test on a handler would catch. Expiration is driven by an injected clock, so
 those tests are deterministic and fast instead of sleeping.
+
+The skiplist gets its own treatment. Spans are redundant bookkeeping that
+nothing else validates, and an off-by-one in insert or delete corrupts them
+silently -- every rank query then returns a plausible but wrong answer. So the
+tests check spans directly against real node positions, across 3000 randomised
+insert/delete operations: promotion heights are random, so a fixed sequence
+would exercise only some of the level-adjustment paths.
+
+Where Redis behaviour was not obvious it was measured rather than guessed, by
+running the same commands against `redis:7-alpine` in Docker. That caught two
+wrong assumptions: `LREM key 2 a` on `[a b a c a]` leaves `[b c a]`, and
+`LPOP key <count>` returns an empty array when the key exists but a null when
+it does not.
 
 Verified against the official tooling:
 
@@ -197,7 +256,7 @@ Port 6380, not 6379, so gedis can run alongside a real Redis for comparison.
 
 - [x] RESP2 protocol, TCP server, pipelining
 - [x] Strings, counters, keyspace, expiration
-- [ ] Lists, hashes, sets, sorted sets
+- [x] Lists, hashes, sets, sorted sets
 - [ ] AOF persistence and replay on restart
 - [ ] RDB-style point-in-time snapshots
 - [ ] Pub/Sub
@@ -214,6 +273,13 @@ Stated plainly, because an interviewer will ask.
   the entire scan are still returned at least once. Doing it properly needs a
   custom hash table with reverse-binary cursors, the way Redis does it, instead
   of Go's built-in map — which exposes no stable iteration cursor.
+- **`HSCAN`, `SSCAN` and `ZSCAN` sort on every call.** Their cursor is an offset
+  into byte order, which costs O(n log n) per call but is the price of a stable
+  position -- Go randomises map iteration, so an offset into raw map order would
+  skip and repeat elements. Redis avoids both with reverse-binary cursors.
+- **`ZRANGEBYLEX` scans rather than seeks.** A skiplist search could find the
+  first match in O(log n), but only by assuming the uniform-score precondition
+  actually holds; scanning stays correct either way.
 - **`MSETNX` is not fully atomic.** It checks every key and then writes. Locking
   all the keys at once invites cross-shard deadlock; the real fix arrives with
   the `MULTI`/`EXEC` machinery.
