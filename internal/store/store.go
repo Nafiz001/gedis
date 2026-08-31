@@ -324,6 +324,95 @@ func (s *Store) Update(key string, fn func(cur *Entry) (*Entry, error)) error {
 	return nil
 }
 
+// UpdateTwo runs fn against two keys with both of their shard write locks held,
+// so a command that moves a value between keys is atomic end to end.
+//
+// This is what LMOVE, RPOPLPUSH and SMOVE need: without it, another client could
+// observe the element missing from both keys, or see it in both at once. fn
+// receives the current entries (nil when absent) and returns their replacements,
+// with nil meaning delete.
+//
+// Both locks are taken in ascending shard order. Two clients running
+// LMOVE a b and LMOVE b a at the same moment would otherwise each hold the lock
+// the other needs.
+func (s *Store) UpdateTwo(k1, k2 string, fn func(e1, e2 *Entry) (*Entry, *Entry, error)) error {
+	i1, i2 := s.indexFor(k1), s.indexFor(k2)
+
+	if i1 == i2 {
+		// One shard: a single lock covers both keys. Taking it twice would
+		// deadlock, since sync.RWMutex is not reentrant.
+		sh := s.shards[i1]
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		return s.applyTwoLocked(sh, sh, k1, k2, fn)
+	}
+
+	first, second := i1, i2
+	if first > second {
+		first, second = second, first
+	}
+	s.shards[first].mu.Lock()
+	defer s.shards[first].mu.Unlock()
+	s.shards[second].mu.Lock()
+	defer s.shards[second].mu.Unlock()
+
+	return s.applyTwoLocked(s.shards[i1], s.shards[i2], k1, k2, fn)
+}
+
+// applyTwoLocked performs the UpdateTwo body; both shards are already locked.
+func (s *Store) applyTwoLocked(sh1, sh2 *shard, k1, k2 string, fn func(e1, e2 *Entry) (*Entry, *Entry, error)) error {
+	now := s.now()
+
+	live := func(sh *shard, key string) *Entry {
+		e, ok := sh.data[key]
+		if !ok {
+			return nil
+		}
+		if e.ExpireAt != NoExpiry && e.ExpireAt <= now {
+			sh.deleteLocked(key)
+			s.expiredKeys.Add(1)
+			return nil
+		}
+		return e
+	}
+
+	e1 := live(sh1, k1)
+	// When both names refer to the same key, hand fn the same entry twice
+	// rather than two views that could disagree.
+	e2 := e1
+	if k1 != k2 {
+		e2 = live(sh2, k2)
+	}
+
+	n1, n2, err := fn(e1, e2)
+	if err != nil {
+		return err
+	}
+
+	if k1 == k2 {
+		// A single key: the second result wins, since fn wrote it last.
+		store2 := n2
+		if store2 == nil {
+			sh1.deleteLocked(k1)
+		} else {
+			sh1.setLocked(k1, store2)
+		}
+		return nil
+	}
+
+	if n1 == nil {
+		sh1.deleteLocked(k1)
+	} else {
+		sh1.setLocked(k1, n1)
+	}
+	if n2 == nil {
+		sh2.deleteLocked(k2)
+	} else {
+		sh2.setLocked(k2, n2)
+	}
+	return nil
+}
+
 // Delete removes keys and returns how many were actually present.
 func (s *Store) Delete(keys ...string) int {
 	now := s.now()
@@ -666,6 +755,8 @@ func TypeName(v any) string {
 	switch v.(type) {
 	case []byte:
 		return "string"
+	case *List:
+		return "list"
 	default:
 		return "none"
 	}

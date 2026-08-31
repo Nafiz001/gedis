@@ -91,6 +91,24 @@ func init() {
 		commandSpec{name: "decrby", handler: cmdDecrBy, arity: 3, write: true},
 		commandSpec{name: "incrbyfloat", handler: cmdIncrByFloat, arity: 3, write: true},
 
+		// --- lists ---
+		commandSpec{name: "lpush", handler: cmdLPush, arity: -3, write: true},
+		commandSpec{name: "rpush", handler: cmdRPush, arity: -3, write: true},
+		commandSpec{name: "lpushx", handler: cmdLPushX, arity: -3, write: true},
+		commandSpec{name: "rpushx", handler: cmdRPushX, arity: -3, write: true},
+		commandSpec{name: "lpop", handler: cmdLPop, arity: -2, write: true},
+		commandSpec{name: "rpop", handler: cmdRPop, arity: -2, write: true},
+		commandSpec{name: "llen", handler: cmdLLen, arity: 2},
+		commandSpec{name: "lrange", handler: cmdLRange, arity: 4},
+		commandSpec{name: "lindex", handler: cmdLIndex, arity: 3},
+		commandSpec{name: "lset", handler: cmdLSet, arity: 4, write: true},
+		commandSpec{name: "linsert", handler: cmdLInsert, arity: 5, write: true},
+		commandSpec{name: "lrem", handler: cmdLRem, arity: 4, write: true},
+		commandSpec{name: "ltrim", handler: cmdLTrim, arity: 4, write: true},
+		commandSpec{name: "lpos", handler: cmdLPos, arity: -3},
+		commandSpec{name: "lmove", handler: cmdLMove, arity: 5, write: true},
+		commandSpec{name: "rpoplpush", handler: cmdLMove, arity: 3, write: true},
+
 		// --- keyspace ---
 		commandSpec{name: "del", handler: cmdDel, arity: -2, write: true},
 		commandSpec{name: "unlink", handler: cmdDel, arity: -2, write: true},
