@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Verify formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Build
+        run: go build -o bin/ ./cmd/...
+
+  compatibility:
+    name: Verify against official redis-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
+      - name: Start gedis
+        run: |
+          go build -o bin/gedis-server ./cmd/gedis-server
+          ./bin/gedis-server --addr 127.0.0.1:6380 &
+          for i in $(seq 1 30); do
+            redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+
+      # The point of this job: the real client, not our own reader, must be able
+      # to drive the server.
+      - name: Exercise it with redis-cli
+        run: |
+          set -e
+          [ "$(redis-cli -p 6380 PING)" = "PONG" ]
+          [ "$(redis-cli -p 6380 SET k v)" = "OK" ]
+          [ "$(redis-cli -p 6380 GET k)" = "v" ]
+          [ "$(redis-cli -p 6380 INCRBY n 41)" = "41" ]
+          [ "$(redis-cli -p 6380 TTL k)" = "-1" ]
+          redis-cli -p 6380 SET s v EX 100 > /dev/null
+          [ "$(redis-cli -p 6380 TTL s)" = "100" ]
+          redis-cli -p 6380 INFO server | grep -q gedis_version
+
+      - name: Run redis-benchmark
+        run: redis-benchmark -p 6380 -t set,get,incr -n 20000 -c 25 -q
