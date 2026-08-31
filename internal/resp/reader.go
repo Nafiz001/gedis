@@ -281,3 +281,9 @@ func (r *Reader) ReadValue() (Value, error) {
 		return Value{}, protoErr("unexpected type byte '%c'", t)
 	}
 }
+
+// Buffered reports how many bytes are already read into memory and not yet
+// consumed. The connection loop uses it to decide whether more pipelined
+// commands are waiting, so it can defer flushing replies until the batch is
+// drained instead of paying a syscall per command.
+func (r *Reader) Buffered() int { return r.br.Buffered() }
