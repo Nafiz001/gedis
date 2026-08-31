@@ -1,0 +1,23 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Data files produced at runtime
+*.aof
+*.rdb
+/data/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
