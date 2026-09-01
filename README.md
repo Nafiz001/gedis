@@ -35,6 +35,42 @@ OK
 2) "backend"
 ```
 
+Transactions, with optimistic locking:
+
+```console
+127.0.0.1:6380> WATCH acct:a
+OK
+127.0.0.1:6380> MULTI
+OK
+127.0.0.1:6380> DECRBY acct:a 30
+QUEUED
+127.0.0.1:6380> INCRBY acct:b 30
+QUEUED
+127.0.0.1:6380> EXEC          # (nil) instead, if another client touched acct:a
+1) (integer) 70
+2) (integer) 80
+```
+
+Pub/Sub, including patterns:
+
+```console
+127.0.0.1:6380> PSUBSCRIBE news.*
+1) "psubscribe"  2) "news.*"  3) (integer) 1
+# elsewhere: PUBLISH news.tech "go 1.27"
+1) "pmessage"  2) "news.*"  3) "news.tech"  4) "go 1.27"
+```
+
+Replication, in two commands:
+
+```console
+127.0.0.1:6391> REPLICAOF 127.0.0.1 6390
+OK
+127.0.0.1:6391> DBSIZE          # the master's keyspace, synced
+(integer) 501
+127.0.0.1:6391> SET k v
+(error) READONLY You can't write against a read only replica.
+```
+
 ## Why build this
 
 Redis is one of the few pieces of infrastructure almost every backend touches,
@@ -45,7 +81,7 @@ matching an error string exactly because real clients branch on it.
 
 ## What works
 
-**135 commands**, matching Redis semantics including the modifier combinations
+**156 commands**, matching Redis semantics including the modifier combinations
 that actually carry meaning.
 
 | Family | Commands |
@@ -59,11 +95,16 @@ that actually carry meaning.
 | Hashes | `HSET`, `HMSET`, `HSETNX`, `HGET`, `HMGET`, `HDEL`, `HLEN`, `HEXISTS`, `HSTRLEN`, `HKEYS`, `HVALS`, `HGETALL`, `HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD`, `HSCAN` |
 | Sets | `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`, `SRANDMEMBER`, `SMOVE`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SINTERCARD`, `SSCAN` |
 | Sorted sets | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`), `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZLEXCOUNT`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`), `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZREM`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`, `ZSCAN`, `ZUNION`, `ZINTER`, `ZDIFF`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
+| Persistence | `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE` |
+| Replication | `REPLICAOF`, `SLAVEOF`, `REPLCONF`, `PSYNC`, `WAIT` |
 | Server | `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `TIME`, `CONFIG`, `DEBUG`, `SHUTDOWN` |
 
 Also: 16 independent `SELECT`-able databases, `requirepass` authentication,
 client pipelining, the inline (telnet) protocol, glob patterns with character
-classes, and graceful shutdown on `SIGINT`/`SIGTERM`.
+classes, `maxmemory` with five eviction policies, and graceful shutdown on
+`SIGINT`/`SIGTERM`.
 
 ## Architecture
 
@@ -90,6 +131,14 @@ classes, and graceful shutdown on `SIGINT`/`SIGTERM`.
               │ Set      map                           │
               │ ZSet     map + skiplist (span-indexed) │
               └────────────────────────────────────────┘
+
+   Every write also enters one propagation stream:
+
+              write ──▶ ┌─────────────────┐
+                        │ append-only log │──▶ disk (fsync policy)
+                        ├─────────────────┤
+                        │ replica links   │──▶ followers
+                        └─────────────────┘
 ```
 
 ### Decisions worth explaining
@@ -138,6 +187,43 @@ Inserts and removals shift whichever side is shorter.
 each -- listpacks for small hashes, intsets for all-integer sets -- purely to
 save memory in its own allocator layout. That buys nothing here and would put a
 size check on every access, so gedis uses one representation and says so.
+
+**One write stream, two consumers.** Durability and replication ask the same
+question — what changed, in what order — so they read the same stream rather
+than each deriving it. A command that is not replayable is rewritten before it
+enters: `SET k v EX 60` becomes the absolute `PXAT` form, or every restart would
+silently renew the key; `SPOP` becomes the `SREM` it turned out to be, or a
+replay would remove different members; `INCRBYFLOAT` becomes `SET`, because
+float arithmetic is not guaranteed identical across builds.
+
+**A log that tolerates damage, and a snapshot that refuses it.** The append-only
+log accepts a truncated tail: that is the expected shape of a crash mid-write,
+and refusing to start would turn a recoverable incident into an outage. The
+snapshot does the opposite — a CRC-64 covers the whole file and a mismatch stops
+the load, because a silently partial restore is worse than no restore. Both are
+installed by rename, so a crash never leaves a half-written file where a good
+one used to be.
+
+**Pub/Sub needed one explicit rule.** It is the only place a command run by one
+client writes to a different client's socket. Every client owns a write lock:
+the connection loop holds it around each reply, a publisher holds it around each
+delivery, so a message can never land in the middle of a reply. Deliveries carry
+a write deadline, so one subscriber that stopped reading cannot hold a publisher
+hostage. The alternative — an outbox channel and a writer goroutine per client —
+doubles the goroutine count to solve what one uncontended mutex already does.
+
+**Transactions are real, and they cost something.** Redis gets `EXEC` isolation
+free by being single-threaded. Here every command holds a shared lock and `EXEC`
+holds it exclusively, so a transaction genuinely runs with the keyspace to
+itself. `WATCH` invalidation is push-based — a write marks watchers dirty at the
+moment it happens — and the store hook behind it costs one atomic load when
+nobody is watching, which is almost always.
+
+**Replication has no gap between the snapshot and the stream.** A replica is
+registered as a stream destination *before* its snapshot is taken, so writes
+arriving mid-sync queue behind the snapshot on the same connection rather than
+falling between the two phases. A test hammers a master with 200 writes during a
+2,000-key sync and checks that every one of them lands.
 
 **Error strings are copied exactly.** The first word of a Redis error
 (`WRONGTYPE`, `NOAUTH`, `WRONGPASS`, `ERR`) is a machine-readable code that real
@@ -206,7 +292,7 @@ ok  github.com/nafizahmed/gedis/internal/server  2.064s
 ok  github.com/nafizahmed/gedis/internal/store   1.767s
 ```
 
-183 tests, race-clean. The server tests are end-to-end over a real TCP socket
+239 tests, race-clean. The server tests are end-to-end over a real TCP socket
 rather than direct handler calls, because the mistakes that matter here are
 reply framing, exact error text, and pipelined ordering — none of which a unit
 test on a handler would catch. Expiration is driven by an injected clock, so
@@ -224,6 +310,27 @@ running the same commands against `redis:7-alpine` in Docker. That caught two
 wrong assumptions: `LREM key 2 a` on `[a b a c a]` leaves `[b c a]`, and
 `LPOP key <count>` returns an empty array when the key exists but a null when
 it does not.
+
+The subsystems added last are tested against the thing they actually promise.
+Persistence tests write, stop the server, start a new one over the same
+directory, and check what came back — including a deliberately truncated log and
+a deliberately corrupted snapshot. Replication tests stand up a real master and
+a real replica on separate ports and let them talk over TCP. Transaction tests
+run the optimistic-locking retry loop from four clients at once and assert no
+update is lost.
+
+That last one earned its keep. Four genuine defects turned up this way, none of
+them typos:
+
+- `EXEC` deadlocked against its own lock, because the reentrancy flag was
+  declared and never set.
+- `EXEC` checked the `WATCH` flag *before* taking the exclusive lock, leaving a
+  window in which another client could still write a watched key — the exact
+  lost update `WATCH` exists to prevent.
+- `RENAME` never notified watchers, so a transaction watching a renamed key
+  committed on data that had moved.
+- Shutdown hung, because the replication goroutine parked on a socket read that
+  nothing closed.
 
 Verified against the official tooling:
 
@@ -249,20 +356,48 @@ $ ./bin/gedis-server --addr :6380
 | `--shards` | `64` | lock shards per database |
 | `--timeout` | `0` | idle connection timeout |
 | `--loglevel` | `info` | `debug`, `info`, `warn`, `error` |
+| `--appendonly` | off | log every write to an append-only file |
+| `--appendfsync` | `everysec` | `always`, `everysec`, or `no` |
+| `--dir` | `.` | directory for persistence files |
+| `--save` | `900:1,300:10,60:10000` | snapshot points as `seconds:changes` |
+| `--maxmemory` | `0` | memory limit, e.g. `512mb` |
+| `--maxmemory-policy` | `noeviction` | plus four LRU/random/TTL policies |
+| `--replicaof` | — | follow a master, as `host:port` |
 
 Port 6380, not 6379, so gedis can run alongside a real Redis for comparison.
+
+Durability is a real trade, so it is a flag rather than a default:
+
+```console
+$ gedis-server --appendonly --appendfsync always    # nothing acknowledged is lost
+$ gedis-server --appendonly                         # at most one second lost
+$ gedis-server --save 60:1000                       # snapshot only
+```
+
+Replication is two commands:
+
+```console
+$ gedis-server --addr :6380 --dir ./master
+$ gedis-server --addr :6381 --dir ./replica --replicaof 127.0.0.1:6380
+$ redis-cli -p 6381 INFO replication
+role:slave
+master_link_status:up
+```
 
 ## Roadmap
 
 - [x] RESP2 protocol, TCP server, pipelining
 - [x] Strings, counters, keyspace, expiration
 - [x] Lists, hashes, sets, sorted sets
-- [ ] AOF persistence and replay on restart
-- [ ] RDB-style point-in-time snapshots
-- [ ] Pub/Sub
-- [ ] Transactions (`MULTI` / `EXEC` / `WATCH`)
-- [ ] Leader-follower replication
-- [ ] Keyspace eviction policies (LRU / LFU)
+- [x] AOF persistence, rewrite, and replay on restart
+- [x] Binary point-in-time snapshots with checksums
+- [x] Pub/Sub, including pattern subscriptions
+- [x] Transactions (`MULTI` / `EXEC` / `WATCH`)
+- [x] Leader-follower replication
+- [x] `maxmemory` with LRU / random / TTL eviction policies
+- [ ] Blocking commands (`BLPOP`, `BRPOP`, `BLMOVE`)
+- [ ] Partial resynchronisation from a replication backlog
+- [ ] Redis Cluster hash slots
 
 ### Known limitations
 
@@ -283,16 +418,31 @@ Stated plainly, because an interviewer will ask.
 - **`MSETNX` is not fully atomic.** It checks every key and then writes. Locking
   all the keys at once invites cross-shard deadlock; the real fix arrives with
   the `MULTI`/`EXEC` machinery.
-- **No persistence yet**, so all data is lost on restart.
+- **Replication has no partial resync.** A replica that reconnects always takes
+  a full snapshot, where Redis would replay a backlog from the replica's offset.
+  For a large keyspace on a flaky link, that is a real cost.
+- **`WAIT` does not block.** It reports how many replicas are currently
+  connected rather than waiting for acknowledgements, so it is a health check
+  rather than a durability barrier. Better to say so than to fake the guarantee.
+- **Eviction approximates twice.** Memory is the Go runtime's live-heap figure,
+  not per-key accounting — it measures the process rather than the keyspace,
+  which is what actually gets OOM-killed, but it is coarse. And victims come
+  from sampling five keys rather than a true LRU list, which is the same
+  approximation Redis makes and for the same reason.
+- **A resyncing replica should not be read from.** The flush and the snapshot
+  load are not atomic together, so there is a window where it looks empty.
+  Redis has the same gap and answers it with `replica-serve-stale-data`.
 - **RESP2 only.** `HELLO 3` is refused with `NOPROTO` rather than answered
   incorrectly.
 
 ## Layout
 
 ```
-cmd/gedis-server   server binary
-cmd/gedis-bench    throughput and latency benchmark client
-internal/resp      RESP2 reader and writer
-internal/store     sharded expiring keyspace
-internal/server    TCP server, dispatch, command handlers
+cmd/gedis-server     server binary
+cmd/gedis-bench      throughput and latency benchmark client
+internal/resp        RESP2 reader and writer
+internal/store       sharded expiring keyspace and value types
+internal/persistence append-only log and binary snapshots
+internal/server      TCP server, dispatch, commands, pub/sub,
+                     transactions, replication, eviction
 ```
