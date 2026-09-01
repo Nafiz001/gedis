@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nafizahmed/gedis/internal/resp"
@@ -41,6 +43,43 @@ type client struct {
 	// which is how QUIT and fatal protocol errors say goodbye politely.
 	closeAfterReply bool
 	lastCommand     string
+
+	// writeMu guards this connection's writer. The connection loop holds it
+	// around each command's reply; a publisher holds it while pushing a
+	// message. It exists because pub/sub is the one place where a command run
+	// by one client writes to another client's socket.
+	writeMu sync.Mutex
+	closing bool
+
+	// internal marks a client with no socket behind it, used to replay the
+	// log at startup and to apply a master's stream.
+	internal bool
+	// fromMaster marks the internal client applying replicated writes, which
+	// is allowed to write even on a read-only replica.
+	fromMaster bool
+
+	// --- propagation, reset before each command ---
+	propagateOverride [][]byte
+	noPropagate       bool
+
+	// --- pub/sub ---
+	channels map[string]struct{}
+	patterns map[string]struct{}
+
+	// --- transactions ---
+	inMulti    bool
+	inExec     bool
+	queued     [][][]byte
+	queueError bool
+	watched    map[watchKey]struct{}
+	// dirtyWatch is set by whichever client writes a key this one watches, so
+	// it crosses goroutines and must be atomic.
+	dirtyWatch atomic.Bool
+
+	// --- replication ---
+	isReplicaConn bool
+	replicaLink   *replicaLink
+	replicaPort   string
 }
 
 func (s *Server) newClient(conn net.Conn) *client {
@@ -62,6 +101,9 @@ func (s *Server) newClient(conn net.Conn) *client {
 		dbIndex:       0,
 		db:            s.dbs[0],
 		authenticated: s.cfg.Password == "",
+		channels:      make(map[string]struct{}),
+		patterns:      make(map[string]struct{}),
+		watched:       make(map[watchKey]struct{}),
 	}
 }
 
@@ -69,6 +111,13 @@ func (s *Server) newClient(conn net.Conn) *client {
 func (c *client) serve() {
 	c.srv.registerClient(c)
 	defer func() {
+		// Leave every registry holding a pointer to this client before the
+		// socket closes, or a publisher could still be handed a dead one.
+		c.srv.pubsub.removeClient(c)
+		c.srv.watch.unwatchAll(c)
+		if c.replicaLink != nil {
+			c.srv.replicas.remove(c.replicaLink.id)
+		}
 		c.srv.unregisterClient(c)
 		_ = c.conn.Close()
 	}()
@@ -102,20 +151,35 @@ func (c *client) serve() {
 			continue
 		}
 
+		// Held across the handler and the flush together, so a published
+		// message can never land in the middle of a reply.
+		c.writeMu.Lock()
 		c.srv.dispatch(c, args)
 
 		if c.closeAfterReply {
 			_ = c.w.Flush()
+			c.closing = true
+			c.writeMu.Unlock()
 			return
 		}
 		// Flush once per batch rather than once per command. When a client
 		// pipelines, the next command is already buffered, so we keep executing
 		// and pay a single write syscall for the whole batch -- this is where
 		// most of the pipelined throughput comes from.
+		var flushErr error
 		if c.r.Buffered() == 0 || c.w.Buffered() >= flushThreshold {
-			if err := c.w.Flush(); err != nil {
-				return
-			}
+			flushErr = c.w.Flush()
+		}
+		c.writeMu.Unlock()
+
+		if flushErr != nil {
+			return
+		}
+		// A connection that just became a replication stream stops being a
+		// client: from here it only carries forwarded writes.
+		if c.isReplicaConn {
+			c.serveAsReplicaLink()
+			return
 		}
 	}
 }

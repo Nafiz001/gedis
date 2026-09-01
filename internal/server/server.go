@@ -18,8 +18,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nafizahmed/gedis/internal/persistence"
 	"github.com/nafizahmed/gedis/internal/store"
 )
+
+// SavePoint triggers an automatic snapshot once Changes writes have
+// accumulated within After. Redis calls these "save" directives.
+type SavePoint struct {
+	After   time.Duration
+	Changes int
+}
 
 // Version is reported by INFO and HELLO.
 const Version = "0.1.0"
@@ -42,6 +50,24 @@ type Config struct {
 	// controllable clock so expiry can be driven deterministically instead of
 	// by sleeping.
 	Clock store.Clock
+
+	// Dir is the directory persistence files live in.
+	Dir string
+	// AppendOnly enables the append-only log.
+	AppendOnly bool
+	// AppendFilename names the log inside Dir.
+	AppendFilename string
+	// AppendFsync sets the log's durability policy.
+	AppendFsync persistence.FsyncPolicy
+	// SnapshotFilename names the snapshot inside Dir.
+	SnapshotFilename string
+	// SavePoints schedule automatic snapshots. Empty disables them.
+	SavePoints []SavePoint
+
+	// MaxMemory caps the process heap in bytes. 0 means no limit.
+	MaxMemory int64
+	// MaxMemoryPolicy decides what to evict once MaxMemory is reached.
+	MaxMemoryPolicy EvictionPolicy
 	// Logger receives server events. Defaults to a text logger on stderr.
 	Logger *slog.Logger
 }
@@ -52,9 +78,20 @@ type Config struct {
 // side-by-side comparison, which is exactly how it gets tested.
 func DefaultConfig() Config {
 	return Config{
-		Addr:      ":6380",
-		Databases: 16,
-		Shards:    store.DefaultShards,
+		Addr:             ":6380",
+		Databases:        16,
+		Shards:           store.DefaultShards,
+		Dir:              ".",
+		AppendFilename:   "gedis.aof",
+		SnapshotFilename: "gedis.rdb",
+		AppendFsync:      persistence.FsyncEverySecond,
+		// The same defaults Redis ships with: snapshot after 1 change in
+		// 15 minutes, 10 in 5, or 10000 in one.
+		SavePoints: []SavePoint{
+			{After: 15 * time.Minute, Changes: 1},
+			{After: 5 * time.Minute, Changes: 10},
+			{After: 1 * time.Minute, Changes: 10000},
+		},
 	}
 }
 
@@ -76,6 +113,40 @@ type Server struct {
 	startedAt time.Time
 	stats     serverStats
 
+	// --- persistence ---
+	aof *persistence.AOF
+	// dirty counts writes since the last successful snapshot, which is what
+	// the save points are measured against.
+	dirty    atomic.Int64
+	lastSave atomic.Int64 // unix seconds
+	// saving and rewriting guard against two background jobs of the same kind
+	// running at once.
+	saving    atomic.Bool
+	rewriting atomic.Bool
+	// loading is set while replaying from disk, so the write stream is not
+	// re-fed with what it just produced.
+	loading atomic.Bool
+
+	// --- replication ---
+	replicas *replicaSet
+	repl     replicationState
+
+	// --- pub/sub ---
+	pubsub *pubsubRegistry
+
+	// --- eviction ---
+	memory *memoryMonitor
+
+	// --- transactions ---
+	watch *watchRegistry
+	// execMu gives EXEC exclusive access to the keyspace. Ordinary commands
+	// hold it shared, so they never block each other.
+	execMu sync.RWMutex
+
+	// stopSave shuts down the save-point and replication goroutines.
+	stopSave     chan struct{}
+	stopSaveOnce sync.Once
+
 	wg sync.WaitGroup
 }
 
@@ -83,6 +154,7 @@ type serverStats struct {
 	connectionsReceived atomic.Int64
 	commandsProcessed   atomic.Int64
 	rejectedConnections atomic.Int64
+	evictedKeys         atomic.Int64
 }
 
 // New creates a Server with its databases initialised but nothing listening.
@@ -108,13 +180,26 @@ func New(cfg Config) *Server {
 		dbs:       make([]*store.Store, cfg.Databases),
 		clients:   make(map[uint64]*client),
 		startedAt: time.Now(),
+		replicas:  newReplicaSet(),
+		pubsub:    newPubsubRegistry(),
+		watch:     newWatchRegistry(),
+		memory:    newMemoryMonitor(),
+		stopSave:  make(chan struct{}),
 	}
+	s.lastSave.Store(time.Now().Unix())
+	s.repl.init()
 	for i := range s.dbs {
 		opts := []store.Option{store.WithShards(cfg.Shards)}
 		if cfg.Clock != nil {
 			opts = append(opts, store.WithClock(cfg.Clock))
 		}
 		s.dbs[i] = store.New(opts...)
+		s.dbs[i].EnableAccessTracking(cfg.MaxMemoryPolicy.needsAccessTracking())
+		// Every key change has to reach the watch registry, which is what
+		// lets EXEC know a WATCHed key moved. The index is captured per
+		// database so the registry can tell them apart.
+		dbIndex := i
+		s.dbs[i].SetModifyHook(func(key string) { s.watch.touch(dbIndex, key) })
 		s.dbs[i].StartExpiryCycle()
 	}
 	return s
@@ -159,11 +244,21 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}
 
+	// Restore before accepting, so no client ever sees a half-loaded keyspace.
+	if err := s.loadFromDisk(); err != nil {
+		return err
+	}
+	if err := s.openAOF(); err != nil {
+		return err
+	}
+	s.startSavePoints()
+
 	s.log.Info("gedis ready to accept connections",
 		"addr", s.Addr().String(),
 		"version", Version,
 		"databases", s.cfg.Databases,
 		"shards_per_db", s.cfg.Shards,
+		"persistence", s.persistenceMode(),
 	)
 
 	// Cancelling the context unblocks Accept by closing the listener; there is
@@ -211,8 +306,25 @@ func (s *Server) Serve(ctx context.Context) error {
 	for _, db := range s.dbs {
 		db.Close()
 	}
+	// Flush the log last, once nothing else can append to it.
+	if s.aof != nil {
+		if err := s.aof.Close(); err != nil {
+			s.log.Error("failed to flush the append-only file on shutdown", "err", err)
+		}
+	}
 	s.log.Info("gedis shut down")
 	return nil
+}
+
+// persistenceMode names the durability strategy in effect, for the startup log.
+func (s *Server) persistenceMode() string {
+	if s.cfg.AppendOnly {
+		return "aof:" + s.cfg.AppendFsync.String()
+	}
+	if len(s.cfg.SavePoints) > 0 {
+		return "snapshot"
+	}
+	return "none"
 }
 
 // ListenAndServe is Serve with a context that is never cancelled by the caller.
@@ -226,6 +338,26 @@ func (s *Server) Close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
+	s.stopSaveOnce.Do(func() { close(s.stopSave) })
+
+	// Stop following a master. The replication goroutine is parked on a
+	// blocking socket read, and closing the stop channel is what makes its
+	// watchdog close that socket -- without this, shutdown waits forever on a
+	// read that will never return.
+	s.repl.mu.Lock()
+	if s.repl.cancel != nil {
+		s.repl.cancel()
+		s.repl.cancel = nil
+	}
+	s.repl.mu.Unlock()
+	s.repl.generation.Add(1)
+
+	// Drop the replicas this server is feeding, so their link goroutines end
+	// too.
+	for _, link := range s.replicas.snapshot() {
+		link.fail()
+	}
+
 	s.lnMu.Lock()
 	if s.ln != nil {
 		_ = s.ln.Close()

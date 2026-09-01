@@ -24,6 +24,10 @@ func cmdFlushDB(c *client, args [][]byte) {
 		return
 	}
 	c.db.Flush()
+	// Flush removes keys without going through the per-key write path, so
+	// watchers have to be invalidated explicitly or a transaction could
+	// survive its data being wiped.
+	c.srv.watch.touchDatabase(c.dbIndex)
 	c.replyOK()
 }
 
@@ -35,6 +39,7 @@ func cmdFlushAll(c *client, args [][]byte) {
 	for i := 0; i < c.srv.cfg.Databases; i++ {
 		c.srv.dbs[i].Flush()
 	}
+	c.srv.watch.touchAll()
 	c.replyOK()
 }
 
@@ -74,6 +79,9 @@ func cmdInfo(c *client, args [][]byte) {
 		b.WriteString("# Clients\r\n")
 		fmt.Fprintf(&b, "connected_clients:%d\r\n", c.srv.clientCount())
 		fmt.Fprintf(&b, "maxclients:%d\r\n", c.srv.cfg.MaxClients)
+		fmt.Fprintf(&b, "clients_in_transaction:%d\r\n", c.srv.blockedTransactionCount())
+		fmt.Fprintf(&b, "pubsub_channels:%d\r\n", len(c.srv.pubsub.channelNames("")))
+		fmt.Fprintf(&b, "pubsub_patterns:%d\r\n", c.srv.pubsub.patternCount())
 		b.WriteString("\r\n")
 	}
 
@@ -88,6 +96,7 @@ func cmdInfo(c *client, args [][]byte) {
 		fmt.Fprintf(&b, "used_memory_rss:%d\r\n", m.Sys)
 		fmt.Fprintf(&b, "mem_allocator:go-%s\r\n", runtime.Version())
 		fmt.Fprintf(&b, "num_gc:%d\r\n", m.NumGC)
+		b.WriteString(c.srv.memoryLimitInfo())
 		b.WriteString("\r\n")
 	}
 
@@ -110,11 +119,12 @@ func cmdInfo(c *client, args [][]byte) {
 		b.WriteString("\r\n")
 	}
 
+	if want("persistence") {
+		b.WriteString(c.srv.persistenceInfo())
+	}
+
 	if want("replication") {
-		b.WriteString("# Replication\r\n")
-		b.WriteString("role:master\r\n")
-		b.WriteString("connected_slaves:0\r\n")
-		b.WriteString("\r\n")
+		b.WriteString(c.srv.replicationInfo())
 	}
 
 	if want("cpu") {
@@ -211,12 +221,16 @@ func cmdConfig(c *client, args [][]byte) {
 
 func (s *Server) configParams() map[string]string {
 	return map[string]string{
-		"maxmemory":              "0",
-		"maxmemory-policy":       "noeviction",
+		"maxmemory":              strconv.FormatInt(s.cfg.MaxMemory, 10),
+		"maxmemory-policy":       s.cfg.MaxMemoryPolicy.String(),
 		"maxclients":             strconv.Itoa(s.cfg.MaxClients),
 		"databases":              strconv.Itoa(s.cfg.Databases),
-		"appendonly":             "no",
-		"save":                   "",
+		"appendonly":             boolToYesNo(s.cfg.AppendOnly),
+		"appendfsync":            s.cfg.AppendFsync.String(),
+		"dir":                    s.cfg.Dir,
+		"dbfilename":             s.cfg.SnapshotFilename,
+		"appendfilename":         s.cfg.AppendFilename,
+		"save":                   formatSavePoints(s.cfg.SavePoints),
 		"timeout":                strconv.Itoa(int(s.cfg.IdleTimeout.Seconds())),
 		"proto-max-bulk-len":     "536870912",
 		"list-max-listpack-size": "128",
@@ -283,4 +297,20 @@ func cmdShutdown(c *client, args [][]byte) {
 	// No reply: Redis closes the connection without answering SHUTDOWN, and a
 	// client that got "+OK" would wrongly believe the socket is still usable.
 	c.closeAfterReply = true
+}
+
+func boolToYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// formatSavePoints renders save points the way the config flag accepts them.
+func formatSavePoints(points []SavePoint) string {
+	parts := make([]string, 0, len(points))
+	for _, p := range points {
+		parts = append(parts, fmt.Sprintf("%d:%d", int(p.After.Seconds()), p.Changes))
+	}
+	return strings.Join(parts, ",")
 }

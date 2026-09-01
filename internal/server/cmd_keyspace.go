@@ -280,7 +280,15 @@ func expireHandler(unit, cmdName string) handlerFunc {
 			return
 		}
 
-		c.replyInt(boolToInt(c.db.Expire(key, expireAt)))
+		ok = c.db.Expire(key, expireAt)
+		if ok {
+			// Always absolute in the stream, so a replay does not restart the
+			// countdown from whenever it happens to run.
+			c.rewriteAs(buildCmd("PEXPIREAT").str(key).int(expireAt))
+		} else {
+			c.suppressPropagation()
+		}
+		c.replyInt(boolToInt(ok))
 	}
 }
 

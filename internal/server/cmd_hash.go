@@ -291,7 +291,10 @@ func cmdHIncrByFloat(c *client, args [][]byte) {
 		c.replyStoreError(err)
 		return
 	}
-	c.replyBulkString(strconv.FormatFloat(result, 'f', -1, 64))
+	encoded := strconv.FormatFloat(result, 'f', -1, 64)
+	// Same reasoning as INCRBYFLOAT: propagate the result, not the sum.
+	c.rewriteAs(buildCmd("HSET").bytes(args[1]).str(field).str(encoded))
+	c.replyBulkString(encoded)
 }
 
 // cmdHRandField implements HRANDFIELD key [count [WITHVALUES]].

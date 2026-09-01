@@ -30,6 +30,12 @@ type commandSpec struct {
 
 	// noAuth marks the few commands allowed before AUTH succeeds.
 	noAuth bool
+
+	// denyOOM marks commands that may allocate, and so are the ones refused
+	// once memory is full. It is deliberately narrower than write: DEL,
+	// EXPIRE and LPOP are writes that only free memory, and refusing those
+	// would leave a server that hit its limit with no way back under it.
+	denyOOM bool
 }
 
 // matchesArity reports whether n arguments satisfy the spec.
@@ -198,6 +204,35 @@ func init() {
 		commandSpec{name: "pexpiretime", handler: cmdPExpireTime, arity: 2},
 		commandSpec{name: "persist", handler: cmdPersist, arity: 2, write: true},
 
+		// --- pub/sub ---
+		commandSpec{name: "subscribe", handler: cmdSubscribe, arity: -2},
+		commandSpec{name: "unsubscribe", handler: cmdUnsubscribe, arity: -1},
+		commandSpec{name: "psubscribe", handler: cmdPSubscribe, arity: -2},
+		commandSpec{name: "punsubscribe", handler: cmdPUnsubscribe, arity: -1},
+		commandSpec{name: "publish", handler: cmdPublish, arity: 3},
+		commandSpec{name: "pubsub", handler: cmdPubSub, arity: -2},
+
+		// --- transactions ---
+		commandSpec{name: "multi", handler: cmdMulti, arity: 1},
+		commandSpec{name: "exec", handler: cmdExec, arity: 1},
+		commandSpec{name: "discard", handler: cmdDiscard, arity: 1},
+		commandSpec{name: "watch", handler: cmdWatch, arity: -2},
+		commandSpec{name: "unwatch", handler: cmdUnwatch, arity: 1},
+
+		// --- persistence ---
+		commandSpec{name: "save", handler: cmdSave, arity: 1},
+		commandSpec{name: "bgsave", handler: cmdBGSave, arity: -1},
+		commandSpec{name: "bgrewriteaof", handler: cmdBGRewriteAOF, arity: 1},
+		commandSpec{name: "lastsave", handler: cmdLastSave, arity: 1},
+
+		// --- replication ---
+		commandSpec{name: "replicaof", handler: cmdReplicaOf, arity: 3},
+		commandSpec{name: "slaveof", handler: cmdReplicaOf, arity: 3},
+		commandSpec{name: "replconf", handler: cmdReplConf, arity: -1},
+		commandSpec{name: "psync", handler: cmdPSync, arity: -1},
+		commandSpec{name: "sync", handler: cmdPSync, arity: -1},
+		commandSpec{name: "wait", handler: cmdWait, arity: 3},
+
 		// --- server ---
 		commandSpec{name: "dbsize", handler: cmdDBSize, arity: 1},
 		commandSpec{name: "flushdb", handler: cmdFlushDB, arity: -1, write: true},
@@ -208,10 +243,65 @@ func init() {
 		commandSpec{name: "debug", handler: cmdDebug, arity: -2},
 		commandSpec{name: "shutdown", handler: cmdShutdown, arity: -1},
 	)
+
+	markDenyOOM()
 }
 
-// dispatch validates and runs one command.
+// denyOOMCommands are the commands that can grow the keyspace.
+//
+// Everything absent from this list still runs when memory is full, which is
+// what makes an OOM condition recoverable: a client can DEL, EXPIRE, LPOP or
+// FLUSHDB its way back under the limit.
+var denyOOMCommands = []string{
+	// strings and counters
+	"set", "setnx", "setex", "psetex", "getset", "mset", "msetnx",
+	"append", "setrange", "incr", "decr", "incrby", "decrby", "incrbyfloat",
+	// lists
+	"lpush", "rpush", "lpushx", "rpushx", "linsert", "lset",
+	"lmove", "rpoplpush",
+	// hashes
+	"hset", "hmset", "hsetnx", "hincrby", "hincrbyfloat",
+	// sets
+	"sadd", "smove", "sinterstore", "sunionstore", "sdiffstore",
+	// sorted sets
+	"zadd", "zincrby", "zunionstore", "zinterstore", "zdiffstore",
+	// keyspace
+	"copy", "rename", "renamenx",
+}
+
+func markDenyOOM() {
+	for _, name := range denyOOMCommands {
+		spec, ok := commands[name]
+		if !ok {
+			panic("gedis: denyOOM names an unregistered command: " + name)
+		}
+		if !spec.write {
+			panic("gedis: denyOOM names a non-write command: " + name)
+		}
+		spec.denyOOM = true
+		commands[name] = spec
+	}
+}
+
+// dispatch is the entry point for one command from a client.
+//
+// It handles the two states that change what a command means -- an open
+// transaction queues instead of running -- and otherwise hands off to execute.
 func (s *Server) dispatch(c *client, args [][]byte) {
+	name := strings.ToLower(string(args[0]))
+	c.lastCommand = name
+
+	// Inside MULTI everything is queued except the commands that steer the
+	// transaction itself.
+	if c.inMulti && !commandsNotQueued[name] {
+		c.queueCommand(name, args)
+		return
+	}
+	s.execute(c, args)
+}
+
+// execute validates and runs one command, then feeds it to the write stream.
+func (s *Server) execute(c *client, args [][]byte) {
 	name := strings.ToLower(string(args[0]))
 	c.lastCommand = name
 
@@ -231,8 +321,56 @@ func (s *Server) dispatch(c *client, args [][]byte) {
 		return
 	}
 
-	spec.handler(c, args)
+	// A RESP2 connection with subscriptions is a one-way message stream, so
+	// only a small set of commands still makes sense on it.
+	if c.inSubscribeMode() && !commandsAllowedWhileSubscribed[name] {
+		c.replyErrorf("ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", name)
+		return
+	}
+
+	// A replica serves reads and refuses writes, so the master stays the one
+	// place data changes. Writes arriving from the master itself are exempt.
+	if spec.write && !c.fromMaster && !c.internal && s.isReplica() {
+		c.replyError("READONLY You can't write against a read only replica.")
+		return
+	}
+
+	// Commands that may allocate have to fit. Under a maxmemory policy this
+	// evicts to make room; under noeviction it is where the write is refused.
+	// Commands that only free memory are exempt, so a full server can still be
+	// emptied.
+	if spec.denyOOM && s.cfg.MaxMemory > 0 && !s.enforceMemoryLimit() {
+		c.replyError("OOM command not allowed when used memory > 'maxmemory'.")
+		return
+	}
+
+	c.propagateOverride = nil
+	c.noPropagate = false
+
+	// Ordinary commands take the shared lock; EXEC takes it exclusively so a
+	// transaction runs with the keyspace to itself. Commands running inside an
+	// EXEC already hold it and must not take it again.
+	if !c.inExec && name != "exec" {
+		s.execMu.RLock()
+		spec.handler(c, args)
+		s.execMu.RUnlock()
+	} else {
+		spec.handler(c, args)
+	}
 	s.stats.commandsProcessed.Add(1)
+
+	// Writes replayed from disk at startup are already in the log; feeding
+	// them back would double every command on the next restart.
+	if spec.write && !s.loading.Load() {
+		cmd := args
+		if c.propagateOverride != nil {
+			cmd = c.propagateOverride
+		}
+		if !c.noPropagate {
+			s.propagate(c.dbIndex, cmd)
+			s.dirty.Add(1)
+		}
+	}
 }
 
 // quotedArgs renders arguments the way Redis does in its unknown-command error.

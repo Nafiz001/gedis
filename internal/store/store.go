@@ -38,7 +38,22 @@ type Entry struct {
 	Value any
 	// ExpireAt is a Unix timestamp in milliseconds, or NoExpiry.
 	ExpireAt int64
+	// Accessed is when this key was last read, in Unix milliseconds, and
+	// backs the LRU eviction policies.
+	//
+	// It is atomic because readers update it while holding only a read lock:
+	// several goroutines can be inside Get for the same key at once, and a
+	// plain assignment there would be a data race.
+	Accessed atomic.Int64
 }
+
+// ModifyHook is called with every key a write path creates, changes or
+// removes. It backs WATCH, which has to know the instant a watched key moves.
+//
+// It runs with the shard lock held, so it must be fast and must not call back
+// into the store. The registry behind it checks an atomic counter first, so
+// the cost when nobody is watching is a single load.
+type ModifyHook func(key string)
 
 // Clock returns the current time as Unix milliseconds. It is injectable so
 // tests can drive expiration deterministically instead of sleeping.
@@ -75,6 +90,22 @@ type Store struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	// modifyHook is installed once at startup, before any concurrent use.
+	modifyHook ModifyHook
+	// trackAccess enables LRU bookkeeping on reads.
+	trackAccess bool
+}
+
+// SetModifyHook installs the write-notification callback. It must be called
+// before the store is shared between goroutines.
+func (s *Store) SetModifyHook(fn ModifyHook) { s.modifyHook = fn }
+
+// notify reports a changed key, if anything is listening.
+func (s *Store) notify(key string) {
+	if s.modifyHook != nil {
+		s.modifyHook(key)
+	}
 }
 
 // Option configures a Store.
@@ -196,6 +227,9 @@ func (s *Store) Get(key string) (any, bool) {
 	var v any
 	if ok {
 		v = e.Value
+		if s.trackAccess {
+			e.Accessed.Store(now)
+		}
 	}
 	sh.mu.RUnlock()
 
@@ -279,10 +313,16 @@ func (s *Store) TTL(key string) (int64, bool) {
 // Set stores value at key with the given deadline (NoExpiry for none),
 // replacing whatever was there.
 func (s *Store) Set(key string, value any, expireAt int64) {
+	e := &Entry{Value: value, ExpireAt: expireAt}
+	// A key written now is the most recently used one, not the least: without
+	// this it would sort as accessed at the zero time and be evicted first.
+	e.Accessed.Store(s.now())
+
 	sh := s.shardFor(key)
 	sh.mu.Lock()
-	sh.setLocked(key, &Entry{Value: value, ExpireAt: expireAt})
+	sh.setLocked(key, e)
 	sh.mu.Unlock()
+	s.notify(key)
 }
 
 // Update runs fn against key while holding its shard write lock, which is how
@@ -314,13 +354,18 @@ func (s *Store) Update(key string, fn func(cur *Entry) (*Entry, error)) error {
 	if err != nil {
 		return err
 	}
+	if next != nil {
+		next.Accessed.Store(now)
+	}
 	if next == nil {
 		if ok {
 			sh.deleteLocked(key)
 		}
+		s.notify(key)
 		return nil
 	}
 	sh.setLocked(key, next)
+	s.notify(key)
 	return nil
 }
 
@@ -397,6 +442,7 @@ func (s *Store) applyTwoLocked(sh1, sh2 *shard, k1, k2 string, fn func(e1, e2 *E
 		} else {
 			sh1.setLocked(k1, store2)
 		}
+		s.notify(k1)
 		return nil
 	}
 
@@ -410,6 +456,8 @@ func (s *Store) applyTwoLocked(sh1, sh2 *shard, k1, k2 string, fn func(e1, e2 *E
 	} else {
 		sh2.setLocked(k2, n2)
 	}
+	s.notify(k1)
+	s.notify(k2)
 	return nil
 }
 
@@ -420,8 +468,10 @@ func (s *Store) Delete(keys ...string) int {
 	for _, key := range keys {
 		sh := s.shardFor(key)
 		sh.mu.Lock()
+		deleted := false
 		if e, ok := sh.data[key]; ok {
 			sh.deleteLocked(key)
+			deleted = true
 			// An already-expired key was logically gone, so it does not count
 			// toward the reply.
 			if e.ExpireAt == NoExpiry || e.ExpireAt > now {
@@ -429,6 +479,9 @@ func (s *Store) Delete(keys ...string) int {
 			}
 		}
 		sh.mu.Unlock()
+		if deleted {
+			s.notify(key)
+		}
 	}
 	return removed
 }
@@ -445,6 +498,7 @@ func (s *Store) Expire(key string, expireAt int64) bool {
 	if !ok {
 		return false
 	}
+	defer s.notify(key)
 	// A deadline in the past deletes the key immediately, which is what Redis
 	// does for EXPIRE with a non-positive TTL.
 	if expireAt <= now {
@@ -470,6 +524,7 @@ func (s *Store) Persist(key string) bool {
 	}
 	e.ExpireAt = NoExpiry
 	delete(sh.expires, key)
+	s.notify(key)
 	return true
 }
 
@@ -485,6 +540,16 @@ func (s *Store) Rename(src, dst string) bool {
 	now := s.now()
 	srcIdx, dstIdx := s.indexFor(src), s.indexFor(dst)
 
+	// Both names change: the source disappears and the destination is
+	// replaced, so anything watching either has to hear about it.
+	renamed := false
+	defer func() {
+		if renamed {
+			s.notify(src)
+			s.notify(dst)
+		}
+	}()
+
 	if srcIdx == dstIdx {
 		sh := s.shards[srcIdx]
 		sh.mu.Lock()
@@ -495,6 +560,7 @@ func (s *Store) Rename(src, dst string) bool {
 		}
 		sh.deleteLocked(src)
 		sh.setLocked(dst, e)
+		renamed = true
 		return true
 	}
 
@@ -514,6 +580,7 @@ func (s *Store) Rename(src, dst string) bool {
 	}
 	srcSh.deleteLocked(src)
 	dstSh.setLocked(dst, e)
+	renamed = true
 	return true
 }
 
@@ -766,4 +833,113 @@ func TypeName(v any) string {
 	default:
 		return "none"
 	}
+}
+
+// --- snapshot support ---
+
+// ShardCount returns how many partitions the keyspace is split into.
+func (s *Store) ShardCount() int { return len(s.shards) }
+
+// ForEachInShard calls fn for every live key in one shard, holding that
+// shard's read lock for the duration.
+//
+// Snapshotting one shard at a time is how gedis works around not being able to
+// fork. Redis forks and lets copy-on-write give the child a frozen view of the
+// whole dataset for free; a Go process cannot fork safely with threads running.
+// The alternatives were to copy the entire keyspace (doubling memory) or to
+// lock everything at once (stalling every client). Locking one shard and
+// encoding it into a buffer pauses only the clients touching that shard, and
+// bounds the extra memory to one shard's serialised size.
+//
+// fn must not call back into the store, and must not retain the value beyond
+// the call: it is the live object, not a copy.
+func (s *Store) ForEachInShard(i int, fn func(key string, value any, expireAt int64)) {
+	if i < 0 || i >= len(s.shards) {
+		return
+	}
+	sh := s.shards[i]
+	now := s.now()
+
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	for key, e := range sh.data {
+		if e.ExpireAt != NoExpiry && e.ExpireAt <= now {
+			continue // expired but not yet reclaimed: do not persist it
+		}
+		fn(key, e.Value, e.ExpireAt)
+	}
+}
+
+// --- eviction support ---
+
+// EnableAccessTracking makes reads record when a key was last touched, which
+// the LRU eviction policies need.
+//
+// It is off unless a maxmemory policy asks for it, because it turns every read
+// into a write: an atomic store on the entry dirties that cache line, so a
+// GET-heavy workload on shared keys pays for it. Redis has the same field and
+// the same cost, but no choice about it.
+func (s *Store) EnableAccessTracking(on bool) { s.trackAccess = on }
+
+// EvictionCandidate is one key considered for eviction.
+type EvictionCandidate struct {
+	Key      string
+	Accessed int64
+	ExpireAt int64
+	HasTTL   bool
+}
+
+// SampleForEviction returns up to n arbitrary keys, optionally only those
+// carrying a TTL.
+//
+// Sampling rather than maintaining a true LRU list is deliberate, and it is
+// what Redis does. An exact LRU needs every read to unlink and relink a node
+// in a global list, which is a write on the hot path and a contention point on
+// a sharded store. Sampling a handful of keys and evicting the worst of them
+// approximates the same outcome closely enough, at no cost until memory is
+// actually tight.
+func (s *Store) SampleForEviction(n int, onlyWithTTL bool) []EvictionCandidate {
+	if n <= 0 {
+		return nil
+	}
+	out := make([]EvictionCandidate, 0, n)
+	start := rand.Intn(len(s.shards))
+
+	for i := 0; i < len(s.shards) && len(out) < n; i++ {
+		sh := s.shards[(start+i)%len(s.shards)]
+		sh.mu.RLock()
+		// Go randomises map iteration, so this is already a random sample
+		// within the shard.
+		source := sh.data
+		if onlyWithTTL {
+			for key := range sh.expires {
+				if len(out) >= n {
+					break
+				}
+				if e, ok := sh.data[key]; ok {
+					out = append(out, EvictionCandidate{
+						Key:      key,
+						Accessed: e.Accessed.Load(),
+						ExpireAt: e.ExpireAt,
+						HasTTL:   true,
+					})
+				}
+			}
+			sh.mu.RUnlock()
+			continue
+		}
+		for key, e := range source {
+			if len(out) >= n {
+				break
+			}
+			out = append(out, EvictionCandidate{
+				Key:      key,
+				Accessed: e.Accessed.Load(),
+				ExpireAt: e.ExpireAt,
+				HasTTL:   e.ExpireAt != NoExpiry,
+			})
+		}
+		sh.mu.RUnlock()
+	}
+	return out
 }

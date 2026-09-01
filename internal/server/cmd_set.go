@@ -191,6 +191,18 @@ func cmdSPop(c *client, args [][]byte) {
 		return
 	}
 
+	// SPOP chooses at random, so the command itself is not replayable: the
+	// log records the removal it turned out to be.
+	if len(popped) == 0 {
+		c.suppressPropagation()
+	} else {
+		rewrite := buildCmd("SREM").bytes(args[1])
+		for _, m := range popped {
+			rewrite = rewrite.str(m)
+		}
+		c.rewriteAs(rewrite)
+	}
+
 	if !hasCount {
 		if len(popped) == 0 {
 			c.replyNull()

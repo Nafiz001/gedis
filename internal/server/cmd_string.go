@@ -182,6 +182,16 @@ func cmdSet(c *client, args [][]byte) {
 		return
 	}
 
+	// Fix up what reaches the log and the replicas. "SET k v EX 60" replayed
+	// an hour from now would give the key another minute of life, so it is
+	// rewritten to the absolute form; a SET that did not happen is dropped.
+	switch {
+	case !didSet:
+		c.suppressPropagation()
+	case opts.hasTTL:
+		c.rewriteAs(buildCmd("SET").str(key).bytes(value).str("PXAT").int(opts.expireAt))
+	}
+
 	if opts.get {
 		if oldExisted {
 			c.replyBulk(oldValue)
@@ -244,6 +254,7 @@ func (c *client) setWithTTL(args [][]byte, unit, cmdName string) {
 		return
 	}
 	c.db.Set(string(args[1]), append([]byte(nil), args[3]...), at)
+	c.rewriteAs(buildCmd("SET").bytes(args[1]).bytes(args[3]).str("PXAT").int(at))
 	c.replyOK()
 }
 
@@ -339,6 +350,18 @@ func cmdGetEx(c *client, args [][]byte) {
 		c.replyStoreError(err)
 		return
 	}
+	switch {
+	case !existed:
+		c.suppressPropagation()
+	case opts.persist:
+		c.rewriteAs(buildCmd("PERSIST").str(key))
+	case opts.hasTTL:
+		c.rewriteAs(buildCmd("PEXPIREAT").str(key).int(opts.expireAt))
+	default:
+		// GETEX with no options is a plain read.
+		c.suppressPropagation()
+	}
+
 	if !existed {
 		c.replyNull()
 		return
@@ -659,7 +682,12 @@ func cmdIncrByFloat(c *client, args [][]byte) {
 		c.replyStoreError(updateErr)
 		return
 	}
-	c.replyBulkString(strconv.FormatFloat(result, 'f', -1, 64))
+	encoded := strconv.FormatFloat(result, 'f', -1, 64)
+	// Propagate the outcome, not the operation: float arithmetic is not
+	// guaranteed bit-identical across builds, so replaying the addition could
+	// drift from replaying the answer. Redis rewrites this the same way.
+	c.rewriteAs(buildCmd("SET").str(key).str(encoded))
+	c.replyBulkString(encoded)
 }
 
 func boolToInt(b bool) int64 {

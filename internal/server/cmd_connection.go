@@ -10,6 +10,21 @@ import (
 )
 
 func cmdPing(c *client, args [][]byte) {
+	// In subscribe mode every frame the client receives is an array, so PING
+	// answers in that shape too rather than with a simple string -- otherwise
+	// a client demultiplexing pushes would choke on the odd one out. Verified
+	// against Redis 7.
+	if c.inSubscribeMode() {
+		payload := ""
+		if len(args) == 2 {
+			payload = string(args[1])
+		}
+		c.replyArrayLen(2)
+		c.replyBulkString("pong")
+		c.replyBulkString(payload)
+		return
+	}
+
 	switch len(args) {
 	case 1:
 		c.replySimple("PONG")
