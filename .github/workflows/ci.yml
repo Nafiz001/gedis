@@ -77,3 +77,56 @@ jobs:
 
       - name: Run redis-benchmark
         run: redis-benchmark -p 6380 -t set,get,incr -n 20000 -c 25 -q
+
+      # Persistence is only meaningful across a restart, so CI does one.
+      - name: Verify data survives a restart
+        run: |
+          set -e
+          pkill -f gedis-server || true
+          sleep 1
+          mkdir -p /tmp/gedis-ci
+          ./bin/gedis-server --addr 127.0.0.1:6380 --dir /tmp/gedis-ci --appendonly &
+          for i in $(seq 1 30); do
+            redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+          redis-cli -p 6380 SET persisted yes > /dev/null
+          redis-cli -p 6380 RPUSH list a b c > /dev/null
+          redis-cli -p 6380 SET expiring v EX 3600 > /dev/null
+          redis-cli -p 6380 SHUTDOWN || true
+          sleep 1
+
+          ./bin/gedis-server --addr 127.0.0.1:6380 --dir /tmp/gedis-ci --appendonly &
+          for i in $(seq 1 30); do
+            redis-cli -p 6380 PING 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+          [ "$(redis-cli -p 6380 GET persisted)" = "yes" ]
+          [ "$(redis-cli -p 6380 LLEN list)" = "3" ]
+          # A deadline must survive as an absolute instant, not restart its
+          # countdown, so the remaining TTL has to be below the original.
+          ttl=$(redis-cli -p 6380 TTL expiring)
+          [ "$ttl" -gt 3000 ] && [ "$ttl" -le 3600 ]
+
+      - name: Verify replication between two servers
+        run: |
+          set -e
+          mkdir -p /tmp/gedis-replica
+          ./bin/gedis-server --addr 127.0.0.1:6381 --dir /tmp/gedis-replica &
+          for i in $(seq 1 30); do
+            redis-cli -p 6381 PING 2>/dev/null | grep -q PONG && break
+            sleep 0.2
+          done
+          redis-cli -p 6381 REPLICAOF 127.0.0.1 6380
+          for i in $(seq 1 50); do
+            [ "$(redis-cli -p 6381 GET persisted)" = "yes" ] && break
+            sleep 0.2
+          done
+          [ "$(redis-cli -p 6381 GET persisted)" = "yes" ]
+          redis-cli -p 6380 SET streamed now > /dev/null
+          for i in $(seq 1 50); do
+            [ "$(redis-cli -p 6381 GET streamed)" = "now" ] && break
+            sleep 0.2
+          done
+          [ "$(redis-cli -p 6381 GET streamed)" = "now" ]
+          redis-cli -p 6381 SET nope v 2>&1 | grep -q READONLY

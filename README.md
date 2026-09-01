@@ -239,15 +239,32 @@ Measured with the included `gedis-bench` over loopback. 11th-gen i5-1155G7,
 100000 requests, 50 clients, pipeline 1, 16-byte values
 
 TEST          REQ/SEC     AVG ms     P50 ms     P99 ms
-PING            71406      0.689      0.637      2.141
-SET             54296      0.911      0.876      3.045
-GET             63245      0.780      0.743      2.083
-INCR            65836      0.751      0.662      2.094
+PING            97230      0.506      0.526      1.521
+SET             79048      0.622      0.533      3.453
+GET             96079      0.514      0.524      1.623
+INCR            97742      0.505      0.522      1.535
 
 400000 requests, 50 clients, pipeline 16
 
-SET            598538      1.287      1.138      4.823
-GET            675571      1.138      1.053      3.973
+SET            780002      0.998      0.928      4.479
+GET           1091156      0.710      0.635      2.528
+```
+
+Two honest caveats. Run-to-run variance on a laptop is wide -- an earlier run of
+the same binary gave 54k for SET where this one gives 79k -- so treat these as a
+range, not a measurement. And that variance is precisely why no claim is made
+that the transaction lock added in the last milestone is free: every command now
+takes a shared lock so `EXEC` can take it exclusively, and the cost of that is
+somewhere below the noise floor of this machine rather than demonstrably zero.
+
+Durability is close to free on this workload, which is the point of the everysec
+policy -- the fsync happens on a background goroutine, not in the request path:
+
+```
+60000 requests, 50 clients, --appendonly --appendfsync everysec
+
+SET            100705      0.486      0.527      1.580
+INCR            95809      0.512      0.530      1.613
 ```
 
 ### Side by side with real Redis
