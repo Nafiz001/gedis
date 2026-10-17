@@ -217,14 +217,13 @@ func (s *Server) backgroundSave() {
 // million lines that reconstruct one integer. A rewrite replaces the history
 // with the shortest set of commands that produces the same data, so the file
 // tracks how much data there is rather than how much has happened.
+//
+// The caller must already have claimed s.rewriting; it is released here.
 func (s *Server) rewriteAOF() error {
+	defer s.rewriting.Store(false)
 	if s.aof == nil {
 		return fmt.Errorf("append-only logging is disabled")
 	}
-	if !s.rewriting.CompareAndSwap(false, true) {
-		return fmt.Errorf("background append only file rewriting already in progress")
-	}
-	defer s.rewriting.Store(false)
 
 	tempPath, err := s.aof.BeginRewrite()
 	if err != nil {
@@ -375,7 +374,11 @@ func cmdBGRewriteAOF(c *client, args [][]byte) {
 		c.replyError("ERR Append only logging is not enabled")
 		return
 	}
-	if c.srv.rewriting.Load() {
+	// Claimed here, before the reply, not on the goroutine: otherwise a client
+	// that sees "started" and immediately asks INFO is told no rewrite is in
+	// progress, and two BGREWRITEAOFs in quick succession both get past this
+	// check.
+	if !c.srv.rewriting.CompareAndSwap(false, true) {
 		c.replyError("ERR Background append only file rewriting already in progress")
 		return
 	}
