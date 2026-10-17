@@ -380,6 +380,7 @@ $ ./bin/gedis-server --addr :6380
 | `--maxmemory` | `0` | memory limit, e.g. `512mb` |
 | `--maxmemory-policy` | `noeviction` | plus four LRU/random/TTL policies |
 | `--replicaof` | — | follow a master, as `host:port` |
+| `--disable-commands` | — | switch commands off, comma separated |
 
 Port 6380, not 6379, so gedis can run alongside a real Redis for comparison.
 
@@ -399,6 +400,17 @@ $ gedis-server --addr :6381 --dir ./replica --replicaof 127.0.0.1:6380
 $ redis-cli -p 6381 INFO replication
 role:slave
 master_link_status:up
+```
+
+A server open to the internet should not let strangers run `CONFIG SET dir`
+plus `SAVE` (which writes files wherever the process may), `REPLICAOF` (which
+makes it connect out to any address) or `SHUTDOWN`. `--disable-commands`
+switches them off the way Redis's `rename-command NAME ""` does: they answer
+as unknown commands, `COMMAND` stops listing them, and a misspelt name stops
+the server at startup rather than leaving the command on.
+
+```console
+$ gedis-server --disable-commands config,debug,replicaof,slaveof,shutdown,save,bgsave
 ```
 
 ## Roadmap

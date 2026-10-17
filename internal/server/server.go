@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,11 @@ type Config struct {
 	MaxMemory int64
 	// MaxMemoryPolicy decides what to evict once MaxMemory is reached.
 	MaxMemoryPolicy EvictionPolicy
+	// DisabledCommands are switched off on this server: they answer as if
+	// they did not exist, which is what Redis does for a command renamed to
+	// "". A server open to the internet uses it to drop CONFIG, DEBUG,
+	// REPLICAOF and anything else a stranger should not be able to run.
+	DisabledCommands []string
 	// Logger receives server events. Defaults to a text logger on stderr.
 	Logger *slog.Logger
 }
@@ -99,6 +105,8 @@ func DefaultConfig() Config {
 type Server struct {
 	cfg Config
 	log *slog.Logger
+	// disabled holds the lowercased names from cfg.DisabledCommands.
+	disabled map[string]bool
 
 	dbs []*store.Store
 
@@ -185,6 +193,10 @@ func New(cfg Config) *Server {
 		watch:     newWatchRegistry(),
 		memory:    newMemoryMonitor(),
 		stopSave:  make(chan struct{}),
+	}
+	s.disabled = make(map[string]bool, len(cfg.DisabledCommands))
+	for _, name := range cfg.DisabledCommands {
+		s.disabled[strings.ToLower(name)] = true
 	}
 	s.lastSave.Store(time.Now().Unix())
 	s.repl.init()

@@ -233,8 +233,9 @@ func (c *client) infoLine() string {
 // completion. Answering it -- even with an empty reply -- is what stops the
 // official CLI from printing an error every time it attaches.
 func cmdCommand(c *client, args [][]byte) {
+	// Only the commands this server answers: a disabled one is not listed.
 	if len(args) == 1 {
-		names := sortedCommandNames()
+		names := c.srv.enabledCommandNames()
 		c.replyArrayLen(len(names))
 		for _, name := range names {
 			writeCommandInfo(c, commands[name])
@@ -244,14 +245,14 @@ func cmdCommand(c *client, args [][]byte) {
 
 	switch strings.ToLower(string(args[1])) {
 	case "count":
-		c.replyInt(int64(len(commands)))
+		c.replyInt(int64(len(c.srv.enabledCommandNames())))
 
 	case "docs":
 		c.replyEmptyArray()
 
 	case "info":
 		if len(args) == 2 {
-			names := sortedCommandNames()
+			names := c.srv.enabledCommandNames()
 			c.replyArrayLen(len(names))
 			for _, name := range names {
 				writeCommandInfo(c, commands[name])
@@ -260,7 +261,7 @@ func cmdCommand(c *client, args [][]byte) {
 		}
 		c.replyArrayLen(len(args) - 2)
 		for _, raw := range args[2:] {
-			spec, ok := commands[strings.ToLower(string(raw))]
+			spec, ok := c.srv.lookupCommand(strings.ToLower(string(raw)))
 			if !ok {
 				c.replyNullArray()
 				continue
@@ -272,15 +273,6 @@ func cmdCommand(c *client, args [][]byte) {
 		c.replyErrorf("ERR Unknown subcommand or wrong number of arguments for '%s'. Try COMMAND HELP.",
 			string(args[1]))
 	}
-}
-
-func sortedCommandNames() []string {
-	names := make([]string, 0, len(commands))
-	for name := range commands {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
 
 // writeCommandInfo emits the six-element description clients expect: name,

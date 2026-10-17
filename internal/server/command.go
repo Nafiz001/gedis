@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -283,6 +284,36 @@ func markDenyOOM() {
 	}
 }
 
+// KnownCommand reports whether gedis implements a command by this name, so a
+// misspelt name in -disable-commands is caught at startup instead of leaving
+// the command it meant switched on.
+func KnownCommand(name string) bool {
+	_, ok := commands[strings.ToLower(name)]
+	return ok
+}
+
+// lookupCommand finds a command by its lowercased name, treating one that is
+// disabled on this server as unknown.
+func (s *Server) lookupCommand(name string) (commandSpec, bool) {
+	if s.disabled[name] {
+		return commandSpec{}, false
+	}
+	spec, ok := commands[name]
+	return spec, ok
+}
+
+// enabledCommandNames lists the commands this server answers, sorted.
+func (s *Server) enabledCommandNames() []string {
+	names := make([]string, 0, len(commands))
+	for name := range commands {
+		if !s.disabled[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // dispatch is the entry point for one command from a client.
 //
 // It handles the two states that change what a command means -- an open
@@ -305,7 +336,7 @@ func (s *Server) execute(c *client, args [][]byte) {
 	name := strings.ToLower(string(args[0]))
 	c.lastCommand = name
 
-	spec, ok := commands[name]
+	spec, ok := s.lookupCommand(name)
 	if !ok {
 		// Redis echoes the arguments back so a typo is easy to spot in a log.
 		c.replyErrorf("ERR unknown command '%s', with args beginning with: %s",

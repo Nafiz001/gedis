@@ -251,7 +251,7 @@ var commandsNotQueued = map[string]bool{
 // queueCommand adds a command to the pending transaction, validating it now so
 // a typo is reported at queue time rather than silently at EXEC.
 func (c *client) queueCommand(name string, args [][]byte) {
-	spec, ok := commands[name]
+	spec, ok := c.srv.lookupCommand(name)
 	if !ok {
 		c.queueError = true
 		c.replyErrorf("ERR unknown command '%s', with args beginning with: %s",

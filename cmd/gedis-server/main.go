@@ -41,6 +41,7 @@ func run() error {
 		maxMemory   string
 		evictPolicy string
 		replicaOf   string
+		disable     string
 	)
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "address to listen on")
 	flag.IntVar(&cfg.Databases, "databases", cfg.Databases, "number of SELECT-able databases")
@@ -61,6 +62,8 @@ func run() error {
 	flag.StringVar(&evictPolicy, "maxmemory-policy", "noeviction",
 		"noeviction, allkeys-lru, allkeys-random, volatile-lru, volatile-random, volatile-ttl")
 	flag.StringVar(&replicaOf, "replicaof", "", "replicate from a master, given as host:port")
+	flag.StringVar(&disable, "disable-commands", "",
+		"commands to switch off, comma separated, e.g. config,debug,replicaof (like Redis's rename-command NAME \"\")")
 	flag.Parse()
 
 	if showVersion {
@@ -89,6 +92,18 @@ func run() error {
 		if cfg.SavePoints, err = server.ParseSavePoints(savePoints); err != nil {
 			return err
 		}
+	}
+	for _, name := range strings.Split(disable, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		// A typo here would leave the command it meant switched on, which is
+		// the opposite of what the flag is for, so it is fatal.
+		if !server.KnownCommand(name) {
+			return fmt.Errorf("-disable-commands: %q is not a gedis command", name)
+		}
+		cfg.DisabledCommands = append(cfg.DisabledCommands, name)
 	}
 	cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	if cfg.MaxMemory > 0 && cfg.MaxMemoryPolicy == server.EvictNone {
