@@ -162,6 +162,15 @@ func (c *client) serve() {
 			c.writeMu.Unlock()
 			return
 		}
+		// A connection that just became a replication stream stops being a
+		// client: from here it only carries forwarded writes. PSYNC flushed
+		// everything it owed, and the writer now belongs to the replica link
+		// and its lock, so this loop must not touch it again.
+		if c.isReplicaConn {
+			c.writeMu.Unlock()
+			c.serveAsReplicaLink()
+			return
+		}
 		// Flush once per batch rather than once per command. When a client
 		// pipelines, the next command is already buffered, so we keep executing
 		// and pay a single write syscall for the whole batch -- this is where
@@ -173,12 +182,6 @@ func (c *client) serve() {
 		c.writeMu.Unlock()
 
 		if flushErr != nil {
-			return
-		}
-		// A connection that just became a replication stream stops being a
-		// client: from here it only carries forwarded writes.
-		if c.isReplicaConn {
-			c.serveAsReplicaLink()
 			return
 		}
 	}

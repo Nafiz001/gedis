@@ -149,6 +149,11 @@ func (link *replicaLink) send(dbIndex int, args [][]byte) {
 	}
 	link.mu.Lock()
 	defer link.mu.Unlock()
+	// Checked again under the lock: the link may have been dropped while
+	// this write was waiting for it.
+	if link.closed.Load() {
+		return
+	}
 
 	buf := encodeReplicationFrame(dbIndex, link.lastDB, args)
 	link.lastDB = dbIndex
@@ -277,9 +282,23 @@ func cmdPSync(c *client, args [][]byte) {
 		port:   c.replicaPort,
 	}
 
-	// Register before snapshotting. Propagation takes the same lock this
-	// registration does, so any write that begins after this point is queued
-	// behind the snapshot rather than lost between the two phases.
+	// The link's lock is held from registration until the snapshot is on the
+	// wire. Propagation from other clients starts the moment the link is
+	// registered, and it writes to this same connection, so without the lock
+	// a forwarded command could land before FULLRESYNC or in the middle of
+	// the snapshot. With it, any write that begins after registration waits
+	// and follows the snapshot rather than being lost between the two phases.
+	link.mu.Lock()
+	defer link.mu.Unlock()
+
+	// abandon drops the link while its lock is still held, so a propagation
+	// already waiting for the lock finds it closed and writes nothing.
+	abandon := func() {
+		srv.replicas.remove(link.id)
+		link.closed.Store(true)
+		c.closeAfterReply = true
+	}
+
 	srv.replicas.add(link)
 	c.replicaLink = link
 	c.isReplicaConn = true
@@ -291,8 +310,7 @@ func cmdPSync(c *client, args [][]byte) {
 
 	c.replySimple(fmt.Sprintf("FULLRESYNC %s %d", replID, offset))
 	if err := c.w.Flush(); err != nil {
-		srv.replicas.remove(link.id)
-		c.closeAfterReply = true
+		abandon()
 		return
 	}
 
@@ -302,21 +320,16 @@ func cmdPSync(c *client, args [][]byte) {
 	payload, err := srv.snapshotBytes()
 	if err != nil {
 		srv.log.Error("failed to build the replication snapshot", "err", err)
-		srv.replicas.remove(link.id)
-		c.closeAfterReply = true
+		abandon()
 		return
 	}
 
-	link.mu.Lock()
 	writeErr := c.w.WriteBulk(payload)
 	if writeErr == nil {
 		writeErr = c.w.Flush()
 	}
-	link.mu.Unlock()
-
 	if writeErr != nil {
-		srv.replicas.remove(link.id)
-		c.closeAfterReply = true
+		abandon()
 		return
 	}
 
