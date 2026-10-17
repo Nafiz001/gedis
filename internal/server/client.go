@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/resp"
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/resp"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // flushThreshold bounds how much reply data accumulates before it is pushed to

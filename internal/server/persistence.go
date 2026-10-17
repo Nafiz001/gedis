@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/persistence"
-	"github.com/nafizahmed/gedis/internal/resp"
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/persistence"
+	"github.com/Nafiz001/gedis/internal/resp"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // aofPath and snapshotPath resolve the configured filenames against Dir.

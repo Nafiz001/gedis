@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/persistence"
-	"github.com/nafizahmed/gedis/internal/resp"
+	"github.com/Nafiz001/gedis/internal/persistence"
+	"github.com/Nafiz001/gedis/internal/resp"
 )
 
 // Replication is leader-follower: one master accepts writes and streams them to

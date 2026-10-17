@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/resp"
+	"github.com/Nafiz001/gedis/internal/resp"
 )
 
 func main() {

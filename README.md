@@ -304,9 +304,9 @@ Component-level, from `go test -bench`:
 
 ```console
 $ go test -race ./...
-ok  github.com/nafizahmed/gedis/internal/resp    2.180s
-ok  github.com/nafizahmed/gedis/internal/server  2.064s
-ok  github.com/nafizahmed/gedis/internal/store   1.767s
+ok  github.com/Nafiz001/gedis/internal/resp    2.180s
+ok  github.com/Nafiz001/gedis/internal/server  2.064s
+ok  github.com/Nafiz001/gedis/internal/store   1.767s
 ```
 
 239 tests, race-clean. The server tests are end-to-end over a real TCP socket

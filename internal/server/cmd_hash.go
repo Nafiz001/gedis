@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 func entryHash(e *store.Entry) (*store.Hash, error) {

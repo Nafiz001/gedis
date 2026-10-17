@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 func TestParseEvictionPolicy(t *testing.T) {

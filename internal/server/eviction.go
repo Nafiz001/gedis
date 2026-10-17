@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // Eviction is what a cache does when it runs out of room: choose something to

@@ -18,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/persistence"
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/persistence"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // SavePoint triggers an automatic snapshot once Changes writes have

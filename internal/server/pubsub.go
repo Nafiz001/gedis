@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // Pub/Sub is the one place where a command run by one client writes to another

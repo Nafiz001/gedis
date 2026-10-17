@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/persistence"
-	"github.com/nafizahmed/gedis/internal/server"
+	"github.com/Nafiz001/gedis/internal/persistence"
+	"github.com/Nafiz001/gedis/internal/server"
 )
 
 func main() {

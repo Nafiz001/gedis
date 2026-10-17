@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 func cmdDBSize(c *client, args [][]byte) {

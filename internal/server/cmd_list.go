@@ -3,7 +3,7 @@ package server
 import (
 	"strings"
 
-	"github.com/nafizahmed/gedis/internal/store"
+	"github.com/Nafiz001/gedis/internal/store"
 )
 
 // entryList extracts the list held by an entry, for use inside a store update.

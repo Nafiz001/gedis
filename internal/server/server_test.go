@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nafizahmed/gedis/internal/resp"
+	"github.com/Nafiz001/gedis/internal/resp"
 )
 
 // These are end-to-end tests: they start a real listener, connect over TCP, and
